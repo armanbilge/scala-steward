@@ -34,6 +34,8 @@ import org.typelevel.log4cats.Logger
 trait CoursierAlg[F[_]] {
   def getArtifactUrl(dependency: Scope.Dependency): F[Option[Uri]]
 
+  def getArtifactVersionScheme(dependency: Scope.Dependency): F[Option[String]]
+
   def getVersions(dependency: Dependency, resolver: Resolver): F[List[Version]]
 
   final def getArtifactIdUrlMapping(dependencies: Scope.Dependencies)(implicit
@@ -41,6 +43,13 @@ trait CoursierAlg[F[_]] {
   ): F[Map[String, Uri]] =
     dependencies.sequence
       .traverseFilter(dep => getArtifactUrl(dep).map(_.map(dep.value.artifactId.name -> _)))
+      .map(_.toMap)
+
+  final def getArtifactIdVersionSchemeMapping(dependencies: Scope.Dependencies)(implicit
+      F: Applicative[F]
+  ): F[Map[String, String]] =
+    dependencies.sequence
+      .traverseFilter(dep => getVersionScheme(dep).map(_.map(dep.value.artifactId.name -> _)))
       .map(_.toMap)
 }
 
@@ -63,6 +72,31 @@ object CoursierAlg {
           dependency: coursier.Dependency,
           repositories: List[coursier.Repository]
       ): F[Option[Uri]] = {
+        val fetchArtifacts = fetch
+          .withArtifactTypes(Set(coursier.Type.pom, coursier.Type.ivy))
+          .withDependencies(List(dependency))
+          .withRepositories(repositories)
+        fetchArtifacts.ioResult.attempt.flatMap {
+          case Left(throwable) =>
+            logger.debug(throwable)(s"Failed to fetch artifacts of $dependency").as(None)
+          case Right(result) =>
+            val maybeProject = result.resolution.projectCache
+              .get(dependency.moduleVersion)
+              .map { case (_, project) => project }
+            maybeProject.traverseFilter { project =>
+              getScmUrlOrHomePage(project.info) match {
+                case Some(url) => F.pure(Some(url))
+                case None =>
+                  getParentDependency(project).traverseFilter(getArtifactUrlImpl(_, repositories))
+              }
+            }
+        }
+      }
+
+      private def getArtifactMetadataImpl[A](
+          dependency: coursier.Dependency,
+          repositories: List[coursier.Repository]
+      )(f: Project => F[A]): F[A] = {
         val fetchArtifacts = fetch
           .withArtifactTypes(Set(coursier.Type.pom, coursier.Type.ivy))
           .withDependencies(List(dependency))
@@ -163,4 +197,7 @@ object CoursierAlg {
 
   private def getScmUrlOrHomePage(info: Info): Option[Uri] =
     uri.findBrowsableUrl(info.scm.flatMap(_.url).toList :+ info.homePage)
+
+  private def getVersionScheme(properties: Seq[(String, String)]): Option[String] =
+    properties.find(_._1 == "info.versionScheme").map(_._2)
 }
